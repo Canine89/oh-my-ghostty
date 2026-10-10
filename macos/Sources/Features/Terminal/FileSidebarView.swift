@@ -7,6 +7,7 @@ import SwiftUI
 /// The root follows the working directory of the last focused surface.
 struct FileSidebarView: View {
     @ObservedObject var surfaceView: Ghostty.SurfaceView
+    @ObservedObject private var herdr = HerdrFocusMonitor.shared
 
     @AppStorage("FileSidebarShowHidden") private var showHidden = false
     @State private var root: URL?
@@ -19,8 +20,15 @@ struct FileSidebarView: View {
         return URL(fileURLWithPath: pwd, isDirectory: true)
     }
 
+    /// herdr does not forward its panes' working directories to the outer terminal,
+    /// so a surface running herdr follows herdr's focused pane through its socket API
+    /// instead. herdr is recognized by its window title (`window_title = "herdr: ..."`).
+    private var isHerdr: Bool { surfaceView.title.hasPrefix(HerdrFocusMonitor.titlePrefix) }
+
+    private var followURL: URL? { isHerdr ? herdr.focusedCwd : surfaceURL }
+
     private var defaultURL: URL {
-        surfaceURL ?? FileManager.default.homeDirectoryForCurrentUser
+        followURL ?? FileManager.default.homeDirectoryForCurrentUser
     }
 
     var body: some View {
@@ -39,9 +47,12 @@ struct FileSidebarView: View {
             }
         }
         .background(Color(nsColor: .controlBackgroundColor))
-        .onAppear { root = defaultURL }
-        .onChange(of: surfaceView.pwd) { _ in
-            if let surfaceURL { root = surfaceURL }
+        .onAppear {
+            HerdrFocusMonitor.shared.start()
+            root = defaultURL
+        }
+        .onChange(of: followURL) { newValue in
+            if let newValue { root = newValue }
         }
     }
 
@@ -432,6 +443,119 @@ private final class ClosureMenuTarget: NSObject {
     }
 
     @objc func run() { action() }
+}
+
+// MARK: - herdr
+
+/// Tracks the working directory of herdr's focused pane. It subscribes to herdr's
+/// focus events on its local socket and re-reads the session snapshot on each one.
+/// When herdr isn't running it quietly retries.
+final class HerdrFocusMonitor: ObservableObject {
+    static let shared = HerdrFocusMonitor()
+    static let titlePrefix = "herdr: "
+
+    @Published private(set) var focusedCwd: URL?
+
+    private var started = false
+    private let socketPath = FileManager.default.homeDirectoryForCurrentUser
+        .appendingPathComponent(".config/herdr/herdr.sock").path
+
+    func start() {
+        guard !started else { return }
+        started = true
+        Thread.detachNewThread { self.run() }
+    }
+
+    private func run() {
+        let subscribe = #"{"id":"ghostty-sub","method":"events.subscribe","params":{"subscriptions":[{"type":"pane.focused"},{"type":"tab.focused"},{"type":"workspace.focused"}]}}"#
+        while true {
+            if let fd = connectSocket() {
+                publish(fetchFocusedCwd())
+                if write(fd, subscribe + "\n") {
+                    var buffer = Data()
+                    while let line = readLine(fd, &buffer) {
+                        if line.contains("\"event\"") { publish(fetchFocusedCwd()) }
+                    }
+                }
+                close(fd)
+            }
+            sleep(3)
+        }
+    }
+
+    private func publish(_ url: URL?) {
+        guard let url else { return }
+        DispatchQueue.main.async {
+            if self.focusedCwd != url { self.focusedCwd = url }
+        }
+    }
+
+    private func fetchFocusedCwd() -> URL? {
+        guard let fd = connectSocket() else { return nil }
+        defer { close(fd) }
+        guard write(fd, #"{"id":"ghostty-snap","method":"session.snapshot","params":{}}"# + "\n") else { return nil }
+        var buffer = Data()
+        guard let line = readLine(fd, &buffer),
+              let json = try? JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any],
+              let result = json["result"] as? [String: Any],
+              let snapshot = result["snapshot"] as? [String: Any],
+              let focused = snapshot["focused_pane_id"] as? String,
+              let panes = snapshot["panes"] as? [[String: Any]],
+              let pane = panes.first(where: { $0["pane_id"] as? String == focused }),
+              let cwd = (pane["foreground_cwd"] as? String) ?? (pane["cwd"] as? String),
+              !cwd.isEmpty
+        else { return nil }
+        return URL(fileURLWithPath: cwd, isDirectory: true)
+    }
+
+    // MARK: Socket
+
+    private func connectSocket() -> Int32? {
+        let fd = socket(AF_UNIX, SOCK_STREAM, 0)
+        guard fd >= 0 else { return nil }
+
+        var addr = sockaddr_un()
+        addr.sun_family = sa_family_t(AF_UNIX)
+        let capacity = MemoryLayout.size(ofValue: addr.sun_path)
+        guard socketPath.utf8.count < capacity else { close(fd); return nil }
+        withUnsafeMutableBytes(of: &addr.sun_path) { raw in
+            raw.copyBytes(from: socketPath.utf8)
+        }
+
+        let connected = withUnsafePointer(to: &addr) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                Darwin.connect(fd, $0, socklen_t(MemoryLayout<sockaddr_un>.size))
+            }
+        }
+        guard connected == 0 else { close(fd); return nil }
+        return fd
+    }
+
+    private func write(_ fd: Int32, _ string: String) -> Bool {
+        let bytes = Array(string.utf8)
+        var offset = 0
+        while offset < bytes.count {
+            let n = bytes[offset...].withUnsafeBytes { Darwin.write(fd, $0.baseAddress, $0.count) }
+            if n <= 0 { return false }
+            offset += n
+        }
+        return true
+    }
+
+    /// Reads one newline-terminated message. Returns nil when the connection closes.
+    private func readLine(_ fd: Int32, _ buffer: inout Data) -> String? {
+        var chunk = [UInt8](repeating: 0, count: 65536)
+        while true {
+            if let newline = buffer.firstIndex(of: UInt8(ascii: "\n")) {
+                let line = buffer[buffer.startIndex..<newline]
+                buffer.removeSubrange(buffer.startIndex...newline)
+                return String(decoding: line, as: UTF8.self)
+            }
+            let n = Darwin.read(fd, &chunk, chunk.count)
+            if n <= 0 { return nil }
+            buffer.append(contentsOf: chunk[0..<n])
+        }
+    }
 }
 
 // MARK: - FSEvents
