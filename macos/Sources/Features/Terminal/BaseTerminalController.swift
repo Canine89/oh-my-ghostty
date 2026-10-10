@@ -51,6 +51,9 @@ class BaseTerminalController: NSWindowController,
     /// Set if the terminal view should show the update overlay.
     @Published var updateOverlayIsVisible: Bool = false
 
+    /// This can be set to show/hide the file sidebar. New windows inherit the last choice.
+    @Published var fileSidebarIsShowing: Bool = UserDefaults.standard.bool(forKey: "FileSidebarVisible")
+
     /// True when any surface in this controller currently has an active bell.
     @Published private(set) var bell: Bool = false
 
@@ -1397,6 +1400,11 @@ class BaseTerminalController: NSWindowController,
 
     @IBAction func toggleCommandPalette(_ sender: Any?) {
         commandPaletteIsShowing.toggle()
+    }
+
+    @IBAction func toggleFileSidebar(_ sender: Any?) {
+        fileSidebarIsShowing.toggle()
+        UserDefaults.standard.set(fileSidebarIsShowing, forKey: "FileSidebarVisible")
     }
 
     @IBAction func find(_ sender: Any) {

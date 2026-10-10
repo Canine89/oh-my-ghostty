@@ -338,6 +338,11 @@
                                     <action selector="toggleCommandPalette:" target="-1" id="FcT-XD-gM1"/>
                                 </connections>
                             </menuItem>
+                            <menuItem title="File Sidebar" keyEquivalent="E" id="fSb-Mn-001">
+                                <connections>
+                                    <action selector="toggleFileSidebar:" target="-1" id="fSb-Ac-001"/>
+                                </connections>
+                            </menuItem>
                             <menuItem title="Change Tab Title..." id="iac-lh-Cl7">
                                 <modifierMask key="keyEquivalentModifierMask"/>
                                 <connections>
